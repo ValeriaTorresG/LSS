@@ -58,7 +58,7 @@ parser.add_argument("--mockfile", help="formattable name of mock file(s). e.g. c
 parser.add_argument("--realmin", help="number for the realization",default=0,type=int)
 parser.add_argument("--realmax", help="number for the realization",default=1,type=int)
 parser.add_argument("--prog", help="dark or bright",default='bright')
-parser.add_argument("--base_output", help="base directory for output",default='/global/cfs/cdirs/desi/survey/catalogs/DA2/mocks/')
+parser.add_argument("--base_output", help="base directory for output",default='/pscratch/sd/v/vtorresg/abacus_y5_altmtl')
 parser.add_argument("--apply_mask", help="apply the same mask as applied to desi targets?",default='n')
 parser.add_argument("--downsampling", help="downsample to Y1 target density in SecondGen Abacus mocks?",default='n')
 parser.add_argument("--isProduction", help="Say yes if you want to save in main production directory",default='y')
@@ -66,7 +66,7 @@ parser.add_argument("--overwrite", help="Overwrite. if it is in production, this
 parser.add_argument("--rbandcut", help = "bgs bright cut", type=float)
 args = parser.parse_args()
 
-tiletab = Table.read('/global/cfs/cdirs/desi/survey/catalogs/DA2/LSS/tiles-{PROG}.fits'.format(PROG = args.prog.upper()))
+# tiletab = Table.read('/global/cfs/cdirs/desi/survey/catalogs/DA2/LSS/tiles-{PROG}.fits'.format(PROG = args.prog.upper()))
 
 if args.prog == 'dark':
     types = ['ELG', 'LRG', 'QSO']
@@ -167,12 +167,16 @@ def process(real):
             data = Table(fitsio.read(thepath, columns=['RA', 'DEC', 'Z', 'Z_COSMO', 'STATUS']))
 
         elif args.mockver == 'ab_secondgen_cosmosim':
-            thepath = os.path.join(mockpath, type_, 'v0.1', zs[type_], file_name.format(TYPE = type_, Z = zs[type_], PH = "%03d" % real))
+            #!--------------------------------------------------- aqui cambio v0.1 por v0
+            thepath = os.path.join(mockpath, type_, 'v0', zs[type_], file_name.format(TYPE = type_, Z = zs[type_], PH = "%03d" % real))
             print('thepath')
             print(thepath)
             data = Table(fitsio.read(thepath, columns=['RA', 'DEC', 'Z', 'Z_COSMO', 'R_MAG_APP', 'R_MAG_ABS', 'IN_Y5', 'G_R_OBS', 'G_R_REST']))
             print("Length before rbandcut")
             print(len(data))
+
+            #!---------------------------------------------------- aqui filtro para Y5
+            # data = data[data['IN_Y5'] == 1]
             
             '''
             data = data[data["R_MAG_APP"]<args.rbandcut]
@@ -220,7 +224,16 @@ def process(real):
             elif args.prog == 'bright':
                 #TEMP AURE in_y5 = data['IN_Y5']
                 #TEMP AURE idx_main = idx[(in_y5 == 1)]
-                idx_main = idx
+                # idx_main = idx
+                #!--------------------------------------------------- aqui filtro para Y5 
+                if args.mockver == 'ab_secondgen_cosmosim':
+                    in_y5 = data['IN_Y5']
+                    idx_main = idx[in_y5 == 1]
+                else:
+                    idx_main = idx
+
+                print("Galaxias originales:", len(data))
+                print("Galaxias seleccionadas en Y5:", len(idx_main))
 
 
             print('SIZE FROM FILE ORIGINAL', len(data))
@@ -250,7 +263,8 @@ def process(real):
 
                 data = Table(data[idx_main])
 
-                print('SIZE FROM FILE AFTER Y1 cut', len(data))
+                #! --------------------------------------------------- aqui filtro para Y5
+                print('SIZE FROM FILE AFTER Y5 cut', len(data))
 
                 data['DESI_TARGET'] = desitar[type_]
                 data['PRIORITY_INIT'] = priority[type_]
@@ -387,9 +401,11 @@ def process(real):
     del datat
     ###if args.mockver != 'ab_secondgen' or args.mockver != 'ab_secondgen_cosmosim':
     print(len(targets),' in Y5 area')
-    selY3 = is_point_in_desi(tiletab, targets['RA'], targets['DEC'])
-    targets = targets[selY3]
-    print(len(targets),' in Y3 area')
+    
+    #!--------------------------------------------------- quitar la geometria de Y3
+    # selY3 = is_point_in_desi(tiletab, targets['RA'], targets['DEC'])
+    # targets = targets[selY3]
+    # print(len(targets),' in Y3 area')
 
     if args.apply_mask == 'y':
         print('getting nobs and mask bits')
@@ -423,9 +439,14 @@ def process(real):
     fits.setval(out_file_name, 'OBSCON', value=args.prog.upper(), ext=1)
 
 
-cpus_per_task = int(os.getenv('SLURM_CPUS_PER_TASK', 6))  # Default to 6 if not set
-with multiprocessing.Pool(processes=cpus_per_task) as pool:
-    # Map the process function to the range of numbers
-    results = pool.map(process, range(args.realmin,args.realmax))
+# cpus_per_task = int(os.getenv('SLURM_CPUS_PER_TASK', 6))  # Default to 6 if not set
+# with multiprocessing.Pool(processes=cpus_per_task) as pool:
+#     # Map the process function to the range of numbers
+#     results = pool.map(process, range(args.realmin,args.realmax))
 
-print(datetime.now() - startTime)
+if __name__ == "__main__":
+
+    for real in range(args.realmin, args.realmax):
+        process(real)
+
+    print(datetime.now() - startTime)

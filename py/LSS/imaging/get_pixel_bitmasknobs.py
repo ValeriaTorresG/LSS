@@ -33,7 +33,7 @@ def bitmask_radec(brickid, ra, dec):
     else:
         # raise ValueError
         # Outside DR9 footprint; assign mask bit 16
-        bitmask = np.full(len(ra), 2**16, dtype=np.uint8)
+        bitmask = np.full(len(ra), 2**16, dtype=np.uint32)
         nobsg = 0
         nobsr = 0
         nobsz = 0
