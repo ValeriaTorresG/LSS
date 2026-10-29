@@ -5,6 +5,8 @@ import numpy as np
 import os
 import argparse
 import sys
+import logging
+from time import perf_counter
 from desitarget.targetmask import obsconditions
 from desimodel.footprint import is_point_in_desi
 import multiprocessing
@@ -14,6 +16,18 @@ from LSS.main.cattools import count_tiles_better
 from LSS.globals import main
 from datetime import datetime
 startTime = datetime.now()
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s',
+                    datefmt='%Y-%m-%d %H:%M:%S', stream=sys.stdout, force=True)
+logger = logging.getLogger(__name__)
+
+
+def progress(real, step, started=None, **counts):
+    details = ', '.join(f'{name}={value:,}' if isinstance(value, int) else f'{name}={value}'
+                        for name, value in counts.items())
+    elapsed = f' ({perf_counter() - started:.1f} s)' if started is not None else ''
+    logger.info('[real %s] %s%s%s', real, step, elapsed, f' | {details}' if details else '')
+    return perf_counter()
 
 
 def create_dir(value):
@@ -102,6 +116,7 @@ else:
 
 
 def process(real):
+    real_start = progress(real, 'Inicio de la realización', mockver=args.mockver, prog=args.prog)
     if not (args.mockver is None):
         if args.mockver == 'ab_firstgen':
             mockpath = '/global/cfs/cdirs/desi/cosmosim/FirstGenMocks/AbacusSummit/CutSky/'
@@ -153,6 +168,7 @@ def process(real):
     print('testing and creating output directory', mockdir)
     create_dir(mockdir)
     print('will write outputs to ', out_file_name)
+    progress(real, 'Rutas preparadas', entrada=mockpath, salida=out_file_name)
 
     
     mockdir = args.base_output
@@ -160,18 +176,19 @@ def process(real):
 
     datat = []
     for type_ in types:
+        read_start = progress(real, f'Leyendo tracer {type_}')
         if args.mockver == 'ab_firstgen' or args.mockver == 'ab_secondgen':
             thepath = os.path.join(mockpath, type_, zs[type_], file_name.format(TYPE = type_, Z = zs[type_], PH = "%03d" % real))
             print('thepath')
             print(thepath)
-            data = Table(fitsio.read(thepath, columns=['RA', 'DEC', 'Z', 'Z_COSMO', 'STATUS']))
+            data = Table(fitsio.read(thepath, columns=['RA', 'DEC', 'Z', 'Z_COSMO', 'STATUS']), copy=False)
 
         elif args.mockver == 'ab_secondgen_cosmosim':
             #!--------------------------------------------------- aqui cambio v0.1 por v0
             thepath = os.path.join(mockpath, type_, 'v0', zs[type_], file_name.format(TYPE = type_, Z = zs[type_], PH = "%03d" % real))
             print('thepath')
             print(thepath)
-            data = Table(fitsio.read(thepath, columns=['RA', 'DEC', 'Z', 'Z_COSMO', 'R_MAG_APP', 'R_MAG_ABS', 'IN_Y5', 'G_R_OBS', 'G_R_REST']))
+            data = Table(fitsio.read(thepath, columns=['RA', 'DEC', 'Z', 'Z_COSMO', 'R_MAG_APP', 'R_MAG_ABS', 'IN_Y5', 'G_R_OBS', 'G_R_REST']), copy=False)
             print("Length before rbandcut")
             print(len(data))
 
@@ -204,17 +221,18 @@ def process(real):
 
         else:
             thepath = os.path.join(mockpath, file_name.format(TYPE = type_, Z = zs[type_], PH = "%03d" % real))
-            data = Table(fitsio.read(thepath, columns=['RA', 'DEC', 'Z', 'Z_COSMO', 'R_MAG_APP', 'R_MAG_ABS', 'G_R_REST']))
+            data = Table(fitsio.read(thepath, columns=['RA', 'DEC', 'Z', 'Z_COSMO', 'R_MAG_APP', 'R_MAG_ABS', 'G_R_REST']), copy=False)
             #TEMP AURE data = Table(fitsio.read(thepath, columns=['RA', 'DEC', 'Z', 'Z_COSMO', 'R_MAG_APP', 'R_MAG_ABS', 'IN_Y5', 'G_R_OBS', 'G_R_REST']))
 
-        print(data.dtype.names)
+        progress(real, f'Lectura de {type_} terminada', read_start, filas=len(data), columnas=len(data.colnames))
+        print(data.dtype.names, flush=True)
         print(type_, len(data))
         if args.prog == 'dark':
             status = data['STATUS'][()]
             idx = np.arange(len(status))
         elif args.prog == 'bright':
-            idx = np.arange(len(data))
-        print(idx)
+            idx = None if args.mockver in ('ab_secondgen', 'ab_secondgen_cosmosim') else np.arange(len(data))
+        progress(real, f'Índices preparados para {type_}', filas=len(data) if idx is None else len(idx))
         args.mockver == 'ab_secondgen_cosmosim'
         if args.mockver == 'ab_secondgen' or args.mockver == 'ab_secondgen_cosmosim':
 
@@ -228,12 +246,13 @@ def process(real):
                 #!--------------------------------------------------- aqui filtro para Y5 
                 if args.mockver == 'ab_secondgen_cosmosim':
                     in_y5 = data['IN_Y5']
-                    idx_main = idx[in_y5 == 1]
+                    idx_main = np.flatnonzero(in_y5 == 1)
+                    del in_y5
                 else:
                     idx_main = idx
 
                 print("Galaxias originales:", len(data))
-                print("Galaxias seleccionadas en Y5:", len(idx_main))
+                print("Galaxias seleccionadas en Y5:", len(data) if idx_main is None else len(idx_main))
 
 
             print('SIZE FROM FILE ORIGINAL', len(data))
@@ -256,12 +275,17 @@ def process(real):
 
             elif type_ == 'BGS':
                 if args.downsampling == 'y':
-                    ran_tot = np.random.uniform(size = len(idx_main))
-                    idx_main = idx_main[(ran_tot<=downsampling[type_])]
+                    selected_count = len(data) if idx_main is None else len(idx_main)
+                    ran_tot = np.random.uniform(size=selected_count)
+                    keep = ran_tot <= downsampling[type_]
+                    idx_main = np.flatnonzero(keep) if idx_main is None else idx_main[keep]
+                    del ran_tot, keep
 
 
 
-                data = Table(data[idx_main])
+                if idx_main is not None:
+                    data = data[idx_main]
+                del idx_main
 
                 #! --------------------------------------------------- aqui filtro para Y5
                 print('SIZE FROM FILE AFTER Y5 cut', len(data))
@@ -277,9 +301,11 @@ def process(real):
                 mask_faint = (data["R_MAG_APP"]>=args.rbandcut)&(data["R_MAG_APP"]<=20.175)
                 dat_bright = data[mask_bright]
                 dat_faint = data[mask_faint]
+                del data, mask_bright, mask_faint
                
                 print('size of BRIGHT', len(dat_bright))
                 print('size of FAINT', len(dat_faint))
+                progress(real, 'Corte BGS por magnitud', bright=len(dat_bright), faint=len(dat_faint))
 
 
                 
@@ -299,6 +325,7 @@ def process(real):
                 SubFracFaint=0.695
                 ran_faint = np.random.uniform(size = len(dat_faint))
                 dat_faint_subfrac = dat_faint[(ran_faint<=SubFracFaint)]
+                del dat_faint, ran_faint
 
                 PromoteFracBGSFaint=0.2
 
@@ -306,6 +333,7 @@ def process(real):
 
                 dat_faint_f = dat_faint_subfrac[(ran_hip>PromoteFracBGSFaint)]
                 dat_faint_hip = dat_faint_subfrac[(ran_hip<=PromoteFracBGSFaint)]
+                del dat_faint_subfrac, ran_hip
 
                 dat_faint_hip['BGS_TARGET'] += 2**3
 
@@ -316,6 +344,8 @@ def process(real):
 
                 datat.append(dat_faint_f)
                 datat.append(dat_faint_hip)
+                progress(real, 'Submuestreo BGS terminado', faint_normal=len(dat_faint_f), faint_hip=len(dat_faint_hip))
+                del dat_bright, dat_faint_f, dat_faint_hip
 
             elif type_ == 'ELG':
 
@@ -397,7 +427,9 @@ def process(real):
 
             datat.append(data)
 
+    stack_start = progress(real, 'Combinando tablas', tablas=len(datat))
     targets = vstack(datat)
+    progress(real, 'Tablas combinadas', stack_start, filas=len(targets))
     del datat
     ###if args.mockver != 'ab_secondgen' or args.mockver != 'ab_secondgen_cosmosim':
     print(len(targets),' in Y5 area')
@@ -409,15 +441,27 @@ def process(real):
 
     if args.apply_mask == 'y':
         print('getting nobs and mask bits')
-        mask = bitmask.get_nobsandmask(targets)
-        maskv = mask.get_nobsandmask()
+        mask_start = progress(real, 'Iniciando cálculo de máscara', filas=len(targets), procesos=8)
+        # mask = bitmask.get_nobsandmask(targets)
+        # maskv = mask.get_nobsandmask()
+
+        #!-----------------------------------------
+        coords = targets[['RA', 'DEC']]
+        mask = bitmask.get_nobsandmask(coords)
+        progress(real, 'Coordenadas entregadas a get_nobsandmask', mask_start, filas=len(coords))
+        # limit the number of processes to a reasonable number, e.g., 8
+        maskv = mask.get_nobsandmask(nproc=8)
+        progress(real, 'NOBS y MASKBITS calculados', mask_start, filas=len(maskv))
+
         maskcols = ['NOBS_G','NOBS_R','NOBS_Z','MASKBITS']
         for col in maskcols:
             targets[col] = maskv[col]
-        del maskv
+        del maskv, mask, coords
         targets = common.cutphotmask(targets, bits=mainp.imbits)
+        progress(real, 'Máscara fotométrica aplicada', mask_start, filas=len(targets))
     else:
         out_file_name = out_file_name.split('.fits')[0] + '_nomask.fits'
+        progress(real, 'Se omite la máscara', salida=out_file_name)
 
 
     n=len(targets)
@@ -433,10 +477,13 @@ def process(real):
     targets['ZWARN'] = np.zeros(n, dtype='i8')+int(0)
     targets['TARGETID'] = np.arange(1,n+1)
 
+    write_start = progress(real, 'Escribiendo FITS', filas=n, salida=out_file_name)
     targets.write(out_file_name, overwrite = args.overwrite)
+    progress(real, 'FITS escrito', write_start, filas=n)
 
     fits.setval(out_file_name, 'EXTNAME', value='TARGETS', ext=1)
     fits.setval(out_file_name, 'OBSCON', value=args.prog.upper(), ext=1)
+    progress(real, 'Realización terminada', real_start, filas=n, salida=out_file_name)
 
 
 # cpus_per_task = int(os.getenv('SLURM_CPUS_PER_TASK', 6))  # Default to 6 if not set
@@ -446,7 +493,10 @@ def process(real):
 
 if __name__ == "__main__":
 
+    np.random.seed(42)
+    print(f'Preparando realizaciones {args.realmin} a {args.realmax - 1} ({args.prog})', flush=True)
+
     for real in range(args.realmin, args.realmax):
         process(real)
 
-    print(datetime.now() - startTime)
+    logger.info('Proceso completo en %s', datetime.now() - startTime)
