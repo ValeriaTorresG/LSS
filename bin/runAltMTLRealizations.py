@@ -53,6 +53,8 @@ parser.add_argument('-ppn', '--ProcPerNode', dest='ProcPerNode', default=None, h
 parser.add_argument('-rmbd', '--realMTLBaseDir', dest='mtldir', default='/global/cfs/cdirs/desi/survey/ops/surveyops/trunk/mtl/', help = 'Location of the real (or mock) MTLs that serve as the basis for the alternate MTLs. Defaults to location of data MTLs. Do NOT include survey or obscon information here. ', required = False, type = str)
 parser.add_argument('-zcd', '--zCatDir', dest='zcatdir', default='/global/cfs/cdirs/desi/spectro/redux/daily/', help = 'Location of the real redshift catalogs for use in alt MTL loop.  Defaults to location of survey zcatalogs.', required = False, type = str)
 parser.add_argument('-zfix', '--zfix', dest='zfix', required=False, default = None, type=str, help = 'Filename with redshifts to fix the update_ledger altZCat')
+parser.add_argument('-nlc', '--noLedgerCache', dest='cacheLedgers', default=True, action='store_false', help = 'set flag to re-parse the ledger files on every read instead of keeping them in memory.')
+parser.add_argument('-fap', '--faProcs', dest='faProcs', default=None, type=int, help = 'Number of workers used to run consecutive fiberassignment actions of one realization in parallel. Defaults to the CPUs available divided by the number of realizations run at once.', required = False)
 
 print(argv)
 
@@ -129,7 +131,7 @@ def procFunc(nproc):
         print(targets['DEC'][0:5])
     else:
         targets = None
-    retval = amt.loop_alt_ledger(args.obscon, survey = args.survey, mtldir = args.mtldir, zcatdir = args.zcatdir, altmtlbasedir = args.altMTLBaseDir.format(mock_number=nproc), ndirs = ndirs, numobs_from_ledger = args.numobs_from_ledger,secondary = args.secondary, getosubp = args.getosubp, quickRestart = args.quickRestart, multiproc = multiproc, nproc = nproc, singleDate = singleDate, redoFA = args.redoFA, mock = args.mock, targets = targets, debug = args.debug, verbose = args.verbose, reproducing = args.reproducing, debugOrig = True, zfix = zfix)
+    retval = amt.loop_alt_ledger(args.obscon, survey = args.survey, mtldir = args.mtldir, zcatdir = args.zcatdir, altmtlbasedir = args.altMTLBaseDir.format(mock_number=nproc), ndirs = ndirs, numobs_from_ledger = args.numobs_from_ledger,secondary = args.secondary, getosubp = args.getosubp, quickRestart = args.quickRestart, multiproc = multiproc, nproc = nproc, singleDate = singleDate, redoFA = args.redoFA, mock = args.mock, targets = targets, debug = args.debug, verbose = args.verbose, reproducing = args.reproducing, debugOrig = True, zfix = zfix, fa_nproc = faProcs, cache_ledgers = args.cacheLedgers)
     gc.collect()
     if args.verbose:
         log.debug('finished with one iteration of procFunc')
@@ -180,13 +182,23 @@ else:
 ###assert(len(inds))
 ##p = Pool(1)
 
+nConcurrent = max(1, min(NProc, len(inds)))
+if args.faProcs is None:
+    faProcs = max(1, len(os.sched_getaffinity(0)) // nConcurrent)
+else:
+    faProcs = args.faProcs
+log.info('faProcs = {0:d}'.format(faProcs))
 
-
-p = Pool(NProc)
-atexit.register(p.close)
-#for i in inds:
-#    procFunc(i)
-result = p.map(procFunc,inds)
+if nConcurrent == 1:
+    # Run in this process: Pool workers are daemonic and could not start
+    # the processes used for the parallel fiberassignment.
+    result = [procFunc(i) for i in inds]
+else:
+    p = Pool(NProc)
+    atexit.register(p.close)
+    #for i in inds:
+    #    procFunc(i)
+    result = p.map(procFunc,inds)
 
 
 if args.profile:

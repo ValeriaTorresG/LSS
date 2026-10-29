@@ -67,6 +67,10 @@ from numpy import random as rand
 import numpy.lib.recfunctions as rfn
 
 import os
+import hashlib
+import types
+import multiprocessing as mp
+from multiprocessing.pool import ThreadPool
 import pickle
 import subprocess
 import sys
@@ -412,13 +416,10 @@ def makeAlternateZCat(zcat, real2AltMap, alt2RealMap, debug = False, verbose = F
     if debug:
         failures = 0
         negativeIDs = 0
-    for n, i in zip(zcatids, range(len(zcatids))):
-        cond = (n == zcatids)
-        if debug and (n < 0):
-            negativeIDs +=1   
-        altid = real2AltMap[n]
-
-        altZCat['TARGETID'][i] = altid
+    if debug:
+        negativeIDs = int(np.sum(zcatids < 0))
+    # Map every real TARGETID to its alternate one in a single column assignment.
+    altZCat['TARGETID'][:] = [real2AltMap[n] for n in zcatids]
     if debug:
         log.info('negIDs')
         log.info(negativeIDs)
@@ -1487,7 +1488,7 @@ def do_fiberassignment(altmtldir, FATiles, survey = 'sv3', obscon = 'dark',
         
     return OrigFAs, AltFAs, AltFAs2, TSs, fadates, FATiles
 
-def make_fibermaps(altmtldir, OrigFAs, AltFAs, AltFAs2, TSs, fadates, tiles, survey = 'sv3', obscon = 'dark', changeFiberOpt = None, verbose = False, debug = False, getosubp = False, redoFA = False):
+def make_fibermaps(altmtldir, OrigFAs, AltFAs, AltFAs2, TSs, fadates, tiles, survey = 'sv3', obscon = 'dark', changeFiberOpt = None, verbose = False, debug = False, getosubp = False, redoFA = False, write_tracker = True):
     A2RMap = {}
     R2AMap = {}
     if verbose:
@@ -1536,8 +1537,10 @@ def make_fibermaps(altmtldir, OrigFAs, AltFAs, AltFAs2, TSs, fadates, tiles, sur
             log.info('unique keys in A2RMap = {0:d}'.format(np.unique(A2RMap.keys()).shape[0]))
             log.info('---')
         #retval = write_amtl_tile_tracker(altmtldir, [t], obscon = obscon, survey = survey, mode = 'fa')
-        retval = write_amtl_tile_tracker(altmtldir, [t], obscon = obscon, survey = survey)
-        log.info('write_amtl_tile_tracker retval = {0}'.format(retval))
+        # When run inside a parallel fa block the parent writes the tracker, in action order.
+        if write_tracker:
+            retval = write_amtl_tile_tracker(altmtldir, [t], obscon = obscon, survey = survey)
+            log.info('write_amtl_tile_tracker retval = {0}'.format(retval))
 
     return A2RMap, R2AMap
 
@@ -1562,7 +1565,128 @@ def to_big_endian_table(tab):
 
     arr_be = arr.byteswap().view(arr.dtype.newbyteorder('>'))
     return Table(arr_be)
-    
+
+# TIMESTAMP (second resolution) recorded right after the last update_ledger() call in this process.
+_last_ledger_update_utc = None
+
+def _mark_ledger_update(survey):
+    global _last_ledger_update_utc
+    _last_ledger_update_utc = get_utc_date(survey=survey)
+
+def _wait_after_ledger_update(survey):
+    """Wait until the UTC second is strictly later than the last ledger update.
+
+    Same guarantee as the old sleep(1) after each update: the next ledger write
+    gets a strictly later TIMESTAMP, so TIMESTAMP order still matches processing
+    order (reprocess_alt_ledger sorts on it). Usually there is nothing to wait for.
+    """
+    if _last_ledger_update_utc is None:
+        return
+    while get_utc_date(survey=survey) <= _last_ledger_update_utc:
+        sleep(0.05)
+
+class _LedgerCache:
+    """Parsed ECSV ledgers kept in memory between reads.
+
+    Ledgers only grow by appended rows, so a re-read only parses the new lines.
+    The file is still read in full every time and the already parsed prefix is
+    checked against its hash; anything else (rewritten, truncated, masked values)
+    falls back to parsing the whole file.
+    """
+    def __init__(self):
+        self.entries = {}
+
+    def read(self, filename, *args, **kwargs):
+        if args or (kwargs.get('format') != 'ascii.ecsv') or (not isinstance(filename, str)) or (not filename.endswith('.ecsv')):
+            return Table.read(filename, *args, **kwargs)
+        with open(filename, 'rb') as f:
+            raw = f.read()
+        ent = self.entries.get(filename)
+        if (ent is not None) and (len(raw) >= ent['size']) and (raw[ent['size']-1:ent['size']] == b'\n'):
+            if hashlib.blake2b(memoryview(raw)[:ent['size']]).digest() == ent['digest']:
+                if len(raw) == ent['size']:
+                    return ent['table']
+                new = Table.read(ent['header'] + raw[ent['size']:].decode(), **kwargs)
+                if not (ent['table'].has_masked_columns or new.has_masked_columns):
+                    table = vstack([ent['table'], new], join_type='exact', metadata_conflicts='silent')
+                    self._store(filename, raw, ent['header'], table)
+                    return table
+        text = raw.decode()
+        table = Table.read(text, **kwargs)
+        # Header = comment lines plus the column-name line.
+        lines = text.split('\n')
+        nhead = next(i for i, l in enumerate(lines) if not l.startswith('#')) + 1
+        self._store(filename, raw, '\n'.join(lines[:nhead]) + '\n', table)
+        return table
+
+    def _store(self, filename, raw, header, table):
+        self.entries[filename] = dict(size = len(raw), digest = hashlib.blake2b(raw).digest(), header = header, table = table)
+
+_ledger_cache = _LedgerCache()
+
+class _CachedLedgerTable(Table):
+    """Stands in for Table inside desitarget.io.read_one_mtl_ledger (see enable_ledger_cache)."""
+    @classmethod
+    def read(cls, *args, **kwargs):
+        return _ledger_cache.read(*args, **kwargs)
+
+def enable_ledger_cache():
+    """Make desitarget.io.read_one_mtl_ledger parse ledgers through _ledger_cache.
+
+    Only the file parsing changes: the rest of read_one_mtl_ledger (data model
+    casting, isodate, unique, ...) is desitarget's own code, run with Table
+    swapped for _CachedLedgerTable.
+    """
+    f = desitarget.io.read_one_mtl_ledger
+    if getattr(f, '_uses_ledger_cache', False):
+        return
+    g = dict(f.__globals__)
+    g['Table'] = _CachedLedgerTable
+    cached = types.FunctionType(f.__code__, g, f.__name__, f.__defaults__, f.__closure__)
+    cached.__kwdefaults__ = f.__kwdefaults__
+    cached.__doc__ = f.__doc__
+    cached._uses_ledger_cache = True
+    desitarget.io.read_one_mtl_ledger = cached
+
+# (altmtldir, actions, kwargs) for the workers of a parallel fa block, set before they start.
+_fa_block_state = None
+
+def _fa_block_worker(i):
+    altmtldir, block, kw = _fa_block_state
+    OrigFAs, AltFAs, AltFAs2, TSs, fadates, tiles = do_fiberassignment(altmtldir, [block[i]], survey = kw['survey'], obscon = kw['obscon'], verbose = kw['verbose'], debug = kw['debug'], getosubp = kw['getosubp'], redoFA = kw['redoFA'], mock = kw['mock'], reproducing = kw['reproducing'])
+    assert(len(OrigFAs))
+    make_fibermaps(altmtldir, OrigFAs, AltFAs, AltFAs2, TSs, fadates, tiles, changeFiberOpt = kw['changeFiberOpt'], verbose = kw['verbose'], debug = kw['debug'], survey = kw['survey'], obscon = kw['obscon'], getosubp = kw['getosubp'], redoFA = kw['redoFA'], write_tracker = False)
+    return i
+
+def run_fa_block(altmtldir, block, nproc, survey = 'sv3', obscon = 'dark', changeFiberOpt = None,
+    verbose = False, debug = False, getosubp = False, redoFA = False, mock = False, reproducing = False):
+    """Run the fiberassignment of consecutive 'fa' actions in parallel.
+
+    fa actions only read the ledgers, so every action in a run of consecutive fa
+    actions sees the same ledger state it would see in the serial loop, and the
+    fba_run call itself is unchanged. The tile tracker is still written by this
+    process in action order, so an interruption leaves the same tracker state as
+    the serial loop.
+    """
+    global _fa_block_state
+    _fa_block_state = (altmtldir, block, dict(survey = survey, obscon = obscon, changeFiberOpt = changeFiberOpt,
+        verbose = verbose, debug = debug, getosubp = getosubp, redoFA = redoFA, mock = mock, reproducing = reproducing))
+    nworkers = min(nproc, len(block))
+    log.info('running {0:d} fa actions with {1:d} workers'.format(len(block), nworkers))
+    if mp.current_process().daemon:
+        # Daemonic processes (e.g. multiprocessing.Pool workers) cannot have children.
+        # Threads still run the fba_run subprocesses concurrently.
+        pool = ThreadPool(nworkers)
+    else:
+        pool = mp.get_context('fork').Pool(nworkers)
+    try:
+        with pool:
+            for i in pool.imap(_fa_block_worker, range(len(block))):
+                retval = write_amtl_tile_tracker(altmtldir, [block[i]], obscon = obscon, survey = survey)
+                log.info('write_amtl_tile_tracker retval = {0}'.format(retval))
+    finally:
+        _fa_block_state = None
+
 # LGN 20260220 Adding tiletracker as a passed argument
 # LGN 20260220 Necessary to check the fa date of an update action
 # LGN 20260220 In order to check if we should pass the ext keyword
@@ -1687,6 +1811,7 @@ def update_alt_ledger(altmtldir,althpdirname, altmtltilefn,  actions, tiletracke
         # ADM update the appropriate ledger.
         # LGN 20250909 Revising this section to update for 1B changes and simplifying
 
+        _wait_after_ledger_update(survey)
         if is_1b:
             #getting abbreviated obscon/path for non 1B survey (i.e. dark1b -> dark)
             althpdirname_short = os.path.join(os.path.dirname(althpdirname), os.path.basename(althpdirname).replace('1b', ''))
@@ -1702,13 +1827,11 @@ def update_alt_ledger(altmtldir,althpdirname, altmtltilefn,  actions, tiletracke
             #Updating ledger (No ext keyword)
             update_ledger(althpdirname, altZCat, obscon=obscon.upper(),numobs_from_ledger=numobs_from_ledger, tabform='ascii.ecsv', targets = targets)
 
-        if verbose or debug:
-            log.info('if main, should sleep 1 second')
         #thisUTCDate = get_utc_date(survey=survey)
         if survey == "main":
-            sleep(1)
-            if verbose or debug:
-                log.info('has slept one second')
+            # This used to sleep(1) so the next ledger write gets a later TIMESTAMP.
+            # Record the time instead and only wait (if needed) before the next write.
+            _mark_ledger_update(survey)
             #t["ALTARCHIVEDATE"] = thisUTCDate
         if verbose or debug:
             log.info('now writing to amtl_tile_tracker')
@@ -1733,7 +1856,8 @@ def loop_alt_ledger(obscon, survey='sv3', zcatdir=None, mtldir=None,
                     getosubp = False, quickRestart = False, redoFA = False,
                     multiproc = False, nproc = None, testDoubleDate = False, 
                     changeFiberOpt = None, targets = None, mock = False,
-                    debug = False, verbose = False, reproducing = False, single_action = False, zfix = None):
+                    debug = False, verbose = False, reproducing = False, single_action = False, zfix = None,
+                    fa_nproc = 1, cache_ledgers = False):
     """Execute full MTL loop, including reading files, updating ledgers.
 
     Parameters
@@ -1786,6 +1910,12 @@ def loop_alt_ledger(obscon, survey='sv3', zcatdir=None, mtldir=None,
         txt filename with 2 columns, TARGETID and z. These will be fixed 
         during update_ledger when creating the Altzcat, which normally reads 
         from the zmtl files. Use these redshifts instead
+    fa_nproc : :class:`int`, optional, defaults to 1
+        Number of workers used to run consecutive `fa` actions (which
+        do not modify the ledgers) in parallel. 1 runs them serially.
+    cache_ledgers : :class:`bool`, optional, defaults to ``False``
+        If ``True`` keep parsed ledgers in memory and only parse the rows
+        appended since the last read (see :func:`enable_ledger_cache`).
 
 
     Returns
@@ -1851,6 +1981,9 @@ def loop_alt_ledger(obscon, survey='sv3', zcatdir=None, mtldir=None,
     ### JL - End of directory/loop variable construction ###
 
 
+    if cache_ledgers:
+        enable_ledger_cache()
+
     if quickRestart:
         raise NotImplementedError('There is no way the quick restart will work properly post refactor.')
         quickRestartFxn(ndirs = ndirs, altmtlbasedir = altmtlbasedir, survey = survey, obscon = obscon, multiproc = multiproc, nproc = nproc)
@@ -1900,9 +2033,30 @@ def loop_alt_ledger(obscon, survey='sv3', zcatdir=None, mtldir=None,
         # open to more elegant solutions!
         first_1b_update_post_lya1b_tileids = [100260, 100449, 100755, 100757, 100762, 100763, 100764, 100777, 100790, 100795,100799, 101900, 101902, 102420, 102566, 102571, 102576, 102588, 102602, 102608,102621, 102838]
         
-        for action in actionList:
-            
+        iaction = 0
+        while iaction < len(actionList):
+            action = actionList[iaction]
+            iaction += 1
+
+            if action['ACTIONTYPE'] not in ('fa', 'update'):
+                # Keep the TIMESTAMP spacing the old sleep(1) after each update gave
+                # (update_alt_ledger waits by itself, right before writing).
+                _wait_after_ledger_update(survey)
+
             if action['ACTIONTYPE'] == 'fa':
+
+                # Consecutive fa actions don't change the ledgers, so they can run in parallel.
+                # Tiles with the lya1b check below are left out of blocks and run alone.
+                fablock = [action]
+                if action['TILEID'] not in first_1b_update_post_lya1b_tileids:
+                    while ((fa_nproc > 1) and (iaction < len(actionList))
+                           and (actionList[iaction]['ACTIONTYPE'] == 'fa')
+                           and (actionList[iaction]['TILEID'] not in first_1b_update_post_lya1b_tileids)):
+                        fablock.append(actionList[iaction])
+                        iaction += 1
+                if len(fablock) > 1:
+                    run_fa_block(altmtldir, fablock, fa_nproc, survey = survey, obscon = obscon, changeFiberOpt = changeFiberOpt, verbose = verbose, debug = debug, getosubp = getosubp, redoFA = redoFA, mock = mock, reproducing = reproducing)
+                    continue
 
                 # LGN 20261019 Checking if TILEID is in the first set of post1b
                 # DARK1B actions, if it is we need to verify the lya1b action has

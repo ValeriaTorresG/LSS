@@ -243,6 +243,7 @@ def process(real):
                 #TEMP AURE in_y5 = data['IN_Y5']
                 #TEMP AURE idx_main = idx[(in_y5 == 1)]
                 # idx_main = idx
+                # idx_main = idx[data['IN_Y5'] == 1]
                 #!--------------------------------------------------- aqui filtro para Y5 
                 if args.mockver == 'ab_secondgen_cosmosim':
                     in_y5 = data['IN_Y5']
@@ -285,6 +286,10 @@ def process(real):
 
                 if idx_main is not None:
                     data = data[idx_main]
+                    data['SRC_ROW'] = idx_main.astype(np.int64, copy=False)
+                else:
+                    data['SRC_ROW'] = np.arange(len(data), dtype=np.int64)
+
                 del idx_main
 
                 #! --------------------------------------------------- aqui filtro para Y5
@@ -476,6 +481,11 @@ def process(real):
     targets['SCND_TARGET'] = np.zeros(n, dtype='i8')+int(0)
     targets['ZWARN'] = np.zeros(n, dtype='i8')+int(0)
     targets['TARGETID'] = np.arange(1,n+1)
+
+    #!---------------------------------------------
+    map_file = out_file_name.replace('.fits', '_source_map.fits')
+    targets[['TARGETID', 'SRC_ROW']].write(map_file, overwrite=False)
+    targets.remove_column('SRC_ROW')
 
     write_start = progress(real, 'Escribiendo FITS', filas=n, salida=out_file_name)
     targets.write(out_file_name, overwrite = args.overwrite)

@@ -1,7 +1,9 @@
 from astropy.table import Table
 import numpy as np
 import time
-from multiprocessing import Pool
+# from multiprocessing import Pool
+from multiprocessing import get_context
+
 import fitsio
 from astropy import wcs
 import os
@@ -43,15 +45,16 @@ def get_maskbit_nobs(cat, nproc = int(ncpus), path_to_bricks='/dvs_ro/cfs/cdirs/
     bidcnts = np.insert(bidcnts, 0, 0)
     bidcnts = np.cumsum(bidcnts)
     bidorder = np.argsort(cat['BRICKID'])
-    bricknames = bricks['BRICKNAME'][np.in1d(bricks['BRICKID'], brickid)]
-    regions = bricks['PHOTSYS'][np.in1d(bricks['BRICKID'], brickid)]
+    bricknames = bricks['BRICKNAME'][np.isin(bricks['BRICKID'], brickid)]
+    regions = bricks['PHOTSYS'][np.isin(bricks['BRICKID'], brickid)]
     files = [ bitmask_dir+'{}/coadd/{}/{}/legacysurvey-{}-maskbits.fits.fz'.format('south' if reg == 'S' else 'north', brickname[:3], brickname, brickname) for brickname, reg in zip(bricknames, regions) ]
     nobs_fns = [bitmask_dir+'{}/coadd/{}/{}/legacysurvey-{}-nexp-{{}}.fits.fz'.format('south' if reg == 'S' else 'north', brickname[:3], brickname, brickname, None) for brickname, reg in zip(bricknames, regions) ]
     idxs = [bidorder[bidcnts[bid_index]: bidcnts[bid_index+1]] for bid_index in np.arange(len(brickid))]
 
     print('Initiate Pool with {} processes'.format(nproc), flush=True)
     st=time.time()
-    pool = Pool(processes=nproc)
+    # pool = Pool(processes=nproc)
+    pool = get_context("fork").Pool(processes=nproc)
     print('Pool initiated in {} sec'.format(time.time()-st), flush=True)
     
     print('Run maskbit and nobs assignement', flush=True)
@@ -59,7 +62,25 @@ def get_maskbit_nobs(cat, nproc = int(ncpus), path_to_bricks='/dvs_ro/cfs/cdirs/
     res = pool.map(_run_mask, zip(files, nobs_fns, idxs))
     pool.close()
     pool.join()
-    cat['MASKBITS'], cat['NOBS_G'], cat['NOBS_R'], cat['NOBS_Z'] = np.hstack([np.vstack(rr) for rr in res])
+    # cat['MASKBITS'], cat['NOBS_G'], cat['NOBS_R'], cat['NOBS_Z'] = np.hstack([np.vstack(rr) for rr in res])
+    maskbits = np.full(len(cat), 4096, dtype=np.int32)
+    nobs_g = np.zeros(len(cat), dtype=np.int32)
+    nobs_r = np.zeros(len(cat), dtype=np.int32)
+    nobs_z = np.zeros(len(cat), dtype=np.int32)
+
+    if len(res) != len(idxs):
+        raise RuntimeError("No se procesaron todos los bricks")
+
+    for indices, (mb, ng, nr, nz) in zip(idxs, res):
+        maskbits[indices] = mb
+        nobs_g[indices] = ng
+        nobs_r[indices] = nr
+        nobs_z[indices] = nz
+
+    cat['MASKBITS'] = maskbits
+    cat['NOBS_G'] = nobs_g
+    cat['NOBS_R'] = nobs_r
+    cat['NOBS_Z'] = nobs_z
 
     gc.collect()
     print('Done in {} sec'.format(time.time()-st), flush=True)
@@ -75,7 +96,10 @@ elif prog=='BRIGHT':
 #file_ = '/global/cfs/projectdirs/desi/mocks/cai/abacus_HF/DR2_v1.0/AbacusSummit_base_c000_ph000/CutSky/ELG_v5/z0.950/forclustering/cutsky_abacusHF_DR2_ELG_z0p950_zcut_0p8to1p6_clustering.dat.fits'
 ##file_ = '/global/cfs/projectdirs/desi/mocks/cai/abacus_HF/DR2_v1.0/randoms/rands_intiles_DARK_nomask_%d_v2.fits' % int(mocknum)
 ##TMEPfile_ = '/global/cfs/cdirs/desi/survey/catalogs/DA2/mocks/SecondGenMocks/{TAG}/forFA{MOCK}_nomask.fits'.format(MOCK=mocknum, TAG=tag) 
-file_ = '/dvs_ro/cfs/cdirs/desi/survey/catalogs/DA2/mocks/Holi/seed0202/forFA202_noimagingmask.fits'
+# file_ = '/dvs_ro/cfs/cdirs/desi/survey/catalogs/DA2/mocks/Holi/seed0202/forFA202_noimagingmask.fits'
+#!-----------------------
+file_ = ('/pscratch/sd/v/vtorresg/abacus_y5_iny5_only/SecondGenMocks/AbacusSummitBGS_v2/forFA0_nomask.fits')
+
 #file_ = '/dvs_ro/cfs/projectdirs/desi/mocks/cai/abacus_HF/DR2_v1.0/AbacusSummit_base_c000_ph000/CutSky/QSO/z1.400/testcontaminants.fits'
 
 #file_ = '/pscratch/sd/e/efdez/Uchuu-GLAM/GLAM/mocks_altmtl/LRG/GLAM-Uchuu_LRG_100_Y3_cut_sky_clustering.h5'
@@ -109,7 +133,11 @@ print('size after cutting photmask is', len(cat))
 #out_file_name='/global/cfs/projectdirs/desi/mocks/cai/abacus_HF/DR2_v1.0/randoms/rands_intiles_DARK_%d_v2.fits' % int(mocknum)
 #out_file_name = '/global/cfs/projectdirs/desi/mocks/cai/abacus_HF/DR2_v1.0/AbacusSummit_base_c000_ph000/CutSky/ELG_v5/z0.950/forclustering/masked_cutsky_abacusHF_DR2_ELG_z0p950_zcut_0p8to1p6_clustering.dat.fits'
 ##out_file_name = 'test_glam_lrg.fits'
-out_file_name = '/global/cfs/cdirs/desi/survey/catalogs/DA2/mocks/Holi/seed0202/forFA202.fits'
+# out_file_name = '/global/cfs/cdirs/desi/survey/catalogs/DA2/mocks/Holi/seed0202/forFA202.fits'
+
+#!-----------------------------
+out_file_name = ('/pscratch/sd/v/vtorresg/abacus_y5_iny5_only/SecondGenMocks/AbacusSummitBGS_v2/forFA0.fits')
+
 #out_file_name = '/global/cfs/projectdirs/desi/mocks/cai/abacus_HF/DR2_v1.0/AbacusSummit_base_c000_ph000/CutSky/QSO/z1.400/forFA_QSO.fits'
 ct.write_LSS_scratchcp(cat, out_file_name, extname='TARGETS')
 print('Done writing in {} sec'.format(time.time()-st), flush=True)

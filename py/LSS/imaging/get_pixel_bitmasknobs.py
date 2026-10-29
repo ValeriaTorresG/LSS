@@ -18,12 +18,30 @@ import argparse
     
 
 bitmask_dir = '/global/cfs/cdirs/cosmo/data/legacysurvey/dr9/'
-bricks = Table(fitsio.read('/global/cfs/cdirs/cosmo/data/legacysurvey/dr9/randoms/survey-bricks-dr9-randoms-0.48.0.fits'))
+bricks = Table(fitsio.read(
+    '/global/cfs/cdirs/cosmo/data/legacysurvey/dr9/randoms/survey-bricks-dr9-randoms-0.48.0.fits',
+    columns=['BRICKID', 'BRICKNAME', 'PHOTSYS'],
+))
+brick_index_by_id = {}
+for brick_index, brickid in enumerate(bricks['BRICKID']):
+    # np.where(...)[0][0] used the first row if an ID appeared more than once.
+    brick_index_by_id.setdefault(int(brickid), brick_index)
+
+_mask_worker_state = None
+
+
+def _init_mask_worker(state):
+    global _mask_worker_state
+    _mask_worker_state = state
+
+
+def _mask_worker(bid_index):
+    return _mask_worker_state.wrapper(bid_index)
 
 
 def bitmask_radec(brickid, ra, dec):
 
-    brick_index = np.where(bricks['BRICKID']==brickid)[0][0]
+    brick_index = brick_index_by_id[int(brickid)]
 
     brickname = str(bricks['BRICKNAME'][brick_index])
     if bricks['PHOTSYS'][brick_index]=='N':
@@ -43,7 +61,7 @@ def bitmask_radec(brickid, ra, dec):
 
     bitmask_img = fitsio.read(bitmask_fn)
 
-    header = fits.open(bitmask_fn)[1].header
+    header = fits.getheader(bitmask_fn, 1)
     w = wcs.WCS(header)
 
     coadd_x, coadd_y = w.wcs_world2pix(ra, dec, 0)
@@ -84,13 +102,20 @@ class get_nobsandmask:
             tmp = brick.Bricks(bricksize=0.25)
             cat['BRICKID'] = tmp.brickid(cat['RA'], cat['DEC'])
         # Just some tricks to speed up things up
-        self.bid_unique, bidcnts = np.unique(cat['BRICKID'], return_counts=True)
-        self.bidcnts = np.insert(bidcnts, 0, 0)
-        self.bidcnts = np.cumsum(self.bidcnts)
+        index_start = time.perf_counter()
         self.bidorder = np.argsort(cat['BRICKID'])
+        sorted_bid = cat['BRICKID'][self.bidorder]
+        if len(sorted_bid):
+            boundaries = np.flatnonzero(sorted_bid[1:] != sorted_bid[:-1]) + 1
+            self.bidcnts = np.concatenate(([0], boundaries, [len(sorted_bid)]))
+            self.bid_unique = sorted_bid[self.bidcnts[:-1]]
+        else:
+            self.bidcnts = np.array([0])
+            self.bid_unique = sorted_bid
         self.cat = cat
 
-        print('adding nobs and mask values to '+str(len(cat))+' rows')
+        print('adding nobs and mask values to '+str(len(cat))+' rows', flush=True)
+        print(f'grouped {len(self.bid_unique)} bricks in {time.perf_counter() - index_start:.1f} s', flush=True)
     def wrapper(self,bid_index):
 
         idx = self.bidorder[self.bidcnts[bid_index]:self.bidcnts[bid_index+1]]
@@ -112,11 +137,24 @@ class get_nobsandmask:
 
     # start multiple worker processes
     def get_nobsandmask(self,nproc=128):
-        with Pool(processes=nproc) as pool:
-            res = pool.map(self.wrapper, np.arange(len(self.bid_unique)))
+        # A bound method makes Pool pickle self (including the full catalog)
+        # for every task batch. Give each worker the state once instead.
+        workers_start = time.perf_counter()
+        print(f'processing {len(self.bid_unique)} bricks with {nproc} workers', flush=True)
+        with Pool(processes=nproc, initializer=_init_mask_worker, initargs=(self,)) as pool:
+            res = pool.map(_mask_worker, range(len(self.bid_unique)))
+        print(f'brick processing finished in {time.perf_counter() - workers_start:.1f} s', flush=True)
 
+        assembly_start = time.perf_counter()
         res = vstack(res)
-        res.sort('idx')
-        res.remove_column('idx')
-        return res
+        # The returned idx values are a permutation of the input row numbers.
+        # Scatter each column directly into that order instead of sorting all rows.
+        idx = res['idx']
+        ordered = Table()
+        for col in ('MASKBITS', 'NOBS_G', 'NOBS_R', 'NOBS_Z', 'TARGETID'):
+            values = np.empty(len(res), dtype=res[col].dtype)
+            values[idx] = res[col]
+            ordered[col] = values
+        print(f'assembled {len(ordered)} rows in {time.perf_counter() - assembly_start:.1f} s', flush=True)
+        return ordered
 
