@@ -18,6 +18,7 @@ from desitarget.internal import sharedmem
 from desimodel.footprint import is_point_in_desi
 
 import gc
+import multiprocessing
 import LSS.main.cattools as ct
 import LSS.common_tools as common
 import LSS.mocktools as mocktools
@@ -315,21 +316,23 @@ if args.mockver == 'ab_secondgen' and args.combd == 'y':
         #td += 1
         fa['TILEID'] = int(tile)
         return fa
+    def _map_tiles(func, tls):
+        '''
+        [func(tile) for tile in tls], run in parallel on all the CPUs available to this
+        job (whatever --par is; the result, in tile order, is the same).  Uses fork so
+        that func can use this script's globals (pa_hdu, fbadir, tids).
+        '''
+        nproc = len(os.sched_getaffinity(0))
+        common.printlog('reading %i tiles with %i processes' % (len(tls), nproc), logger)
+        if nproc == 1:
+            return [func(tile) for tile in tls]
+        with multiprocessing.get_context('fork').Pool(processes=nproc) as pool:
+            return pool.map(func, list(tls), chunksize=4)
+
     pa_hdu = 'FASSIGN'
     addcols=['TARGETID','RSDZ','ZWARN']
-    tl = []    
     tls = tiles['TILEID']
-    if args.par == 'n':
-        for tile in tiles['TILEID']:
-            fa = _get_fa(tile)
-            tl.append(fa)
-    if args.par == 'y':
-        #doesn't seem to work within function
-        from concurrent.futures import ProcessPoolExecutor
-        
-        with ProcessPoolExecutor() as executor:
-            for fa in executor.map(_get_fa, list(tls)):
-                tl.append(fa)
+    tl = _map_tiles(_get_fa, tls)
         
     asn = vstack(tl)
     common.printlog('size combitles for ' + pa_hdu+' , '+str(len(asn)),logger=logger)
@@ -337,7 +340,7 @@ if args.mockver == 'ab_secondgen' and args.combd == 'y':
     asn = join(asn, tar_in, keys=['TARGETID'],join_type='left')
     #print(len(dat_comb))
     outf = os.path.join(outdir, 'datcomb_' + pdir + 'assignwdup.fits')
-    common.write_LSS_scratchcp(asn,outf,logger=logger)
+    common.write_LSS_par(asn,outf,logger=logger)
 
     #if using alt MTL that should have ZWARN_MTL, put that in here
     asn['ZWARN_MTL'] = np.copy(asn['ZWARN'])
@@ -352,20 +355,8 @@ if args.mockver == 'ab_secondgen' and args.combd == 'y':
             addcols.append('G_R_OBS')
             addcols.append('G_R_REST')
         #pa = common.combtiles_wdup_altmtl('FAVAIL', tiles, fbadir, os.path.join(outdir, 'datcomb_' + pdir + 'wdup.fits'), tarf, addcols=cols,logger=logger)
-        tl = []    
         tls = tiles['TILEID']
-        
-        if args.par == 'n':
-            for tile in tiles['TILEID']:
-                fa = _get_fa(tile)
-                tl.append(fa)
-        if args.par == 'y':
-            #doesn't seem to work within function
-            from concurrent.futures import ProcessPoolExecutor
-            
-            with ProcessPoolExecutor() as executor:
-                for fa in executor.map(_get_fa, list(tls)):
-                    tl.append(fa)
+        tl = _map_tiles(_get_fa, tls)
             
         pa = vstack(tl)
         del tl
@@ -383,12 +374,15 @@ if args.mockver == 'ab_secondgen' and args.combd == 'y':
         pota_cols = ['LOCATION','FIBER','TARGETID','TILEID','RA','DEC','PRIORITY_INIT','DESI_TARGET','COLLISION']
         if pdir == 'bright':
             pota_cols.append('BGS_TARGET')
-            pota_cols.append('ABSMAG_R')
+            # pota_cols.append('ABSMAG_R') 
             #pota_cols.append('R_MAG_ABS')
-            pota_cols.append('REST_GMR_0P1')
+            # pota_cols.append('REST_GMR_0P1')
+            #!----------------------------------------------
+            pota_cols.append('R_MAG_ABS')
+            pota_cols.append('G_R_REST')
             
         #BGS_TARGET
-        pa = fitsio.read(pota_fn,columns=pota_cols)
+        pa = common.read_fits_par(pota_fn,columns=pota_cols)
         common.printlog('read '+str(len(pa))+' potential assignments',logger)
         sel_coll = pa['COLLISION'] == 0
         pa = pa[sel_coll]
@@ -396,7 +390,7 @@ if args.mockver == 'ab_secondgen' and args.combd == 'y':
 
     outf = os.path.join(outdir, 'datcomb_' + pdir + 'wdup.fits')   
     if args.joindspec == 'n':#no need to waste time writing out if not going to be read
-        common.write_LSS_scratchcp(pa,outf,logger=logger)
+        common.write_LSS_par(pa,outf,logger=logger)
 
 
 #print('asn is',asn)
@@ -423,7 +417,7 @@ if args.joindspec == 'y':
     common.printlog('HERE!!!, about to join assignments and potential assignments',logger)
     print('pa',pa.columns, len(pa))
     print('asn',asn.columns, len(asn))
-    tj = join(pa, asn, keys = ['TARGETID', 'LOCATION', 'TILEID'], join_type = 'left')
+    tj = common.join_unique_keys(pa, asn, ['TARGETID', 'LOCATION', 'TILEID'], join_type = 'left', logger=logger)
     tj['ZWARN'] = tj['ZWARN'].filled(999999)
     sel = tj['ZWARN'] == 999999
     common.printlog('number with no assignments '+str(np.sum(sel))+' total number '+str(len(tj)),logger=logger)
@@ -447,7 +441,7 @@ if args.joindspec == 'y':
     if args.outmd == 'scratch':
         outfs = outfs.replace('/global/cfs/cdirs/desi/survey/catalogs/',os.getenv('SCRATCH')+'/')
 
-    common.write_LSS_scratchcp(tj,outfs,logger=logger)
+    common.write_LSS_par(tj,outfs,logger=logger)
     #tj.write(outfs, format = 'fits', overwrite = True)
     #common.print('wrote ' + outfs)
     #don't do this anymore, it gets done within mkfulld
@@ -473,7 +467,7 @@ if args.fulld == 'y':
     mainp = main(args.tracer, args.specdata, survey=args.survey)
 
     ftar = None
-    dz = os.path.join(lssdir, 'datcomb_'+pdir+'_tarspecwdup_zdone.fits')
+    dz = os.path.join(lssdir, 'datcomb_'+pdir+'_tarspecwdup.fits')
     if args.outmd == 'scratch':
         dz = dz.replace('/global/cfs/cdirs/desi/survey/catalogs/',os.getenv('SCRATCH')+'/')
 
@@ -597,7 +591,8 @@ if args.fullr == 'y':
 ##        ct.mkfullran(gtlf,lznp,lssdir,rannum,imbits,outf,args.tracer,pdir,notqso=notqso,maxp=maxp,tlid_full=tlid_full)
     if args.par == 'n':
         for rn in range(rannum[0], rannum[1]):
-            if os.path.isfile(os.path.join(dirout, args.tracer+notqso+'_'+str(rann)+'_full_noveto.ran.fits')):
+            # if os.path.isfile(os.path.join(dirout, args.tracer+notqso+'_'+str(rann)+'_full_noveto.ran.fits')):
+            if os.path.isfile(os.path.join(dirout, pdir + '_' + str(rn) + '_full_noveto.ran.fits')):
                 pass
             else:
                 _parfun1(rn)
@@ -625,12 +620,14 @@ tracer_clus = args.tracer + notqso
 nside = 256
 if survey == 'Y1' and args.specdata == 'iron':
     vermap = 'v0.6'
-elif survey == 'DA2' and args.specdata == 'jura-v1': 
+elif survey == 'DA2' and args.specdata == 'jura-v1':
     vermap = 'v0.1'
-elif survey == 'DA2' and args.specdata == 'kibo-v1':   
-    vermap = 'v1'  
+elif survey == 'DA2' and args.specdata == 'kibo-v1':
+    vermap = 'v1'
 elif survey == 'DA2' and args.specdata == 'loa-v1':
-    vermap = 'v1.1' 
+    vermap = 'v1.1'
+elif survey == 'DA3' and args.specdata == 'matterhorn-v2':
+    vermap = 'v0.1'
 else:
     raise Exception('survey and specdata not compatible')
 
@@ -909,8 +906,12 @@ if args.mkclusran == 'y':
         if 'R_MAG_ABS' in cols_clustering:
             rcols.append('R_MAG_ABS')
         '''
-        rcols.append('ABSMAG_R')
-        rcols.append('REST_GMR_0P1')
+        # rcols.append('ABSMAG_R')
+        # rcols.append('REST_GMR_0P1')
+        
+        rcols.append('R_MAG_ABS')
+        rcols.append('G_R_REST')
+        
         tsnrcol = 'TSNR2_BGS'
         if args.ccut is not None:
             for rn in range(rannum[0], rannum[1]):

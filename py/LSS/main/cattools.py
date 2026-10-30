@@ -3344,11 +3344,16 @@ def mkfulldat(zf,imbits,ftar,tp,bit,outf,ftiles,mode1b=0,maxp=3400,good_specf=No
             fs = common.read_hdf5_blosc(assignf+'.h5')
         elif os.path.isfile(assignf+'.fits'):
             common.printlog('reading '+assignf+'.fits',logger)
-            fs = fitsio.read(assignf.replace('global', 'dvs_ro'))
+            fs = fitsio.read((assignf+'.fits').replace('global', 'dvs_ro'))
             fs = Table(fs)
         else:
             common.printlog(fs +' not found!',logger)
         fs['TILELOCID'] = 10000*fs['TILEID'] +fs['LOCATION']
+        won = Table({'TILELOCID': np.asarray(fs['TILELOCID'], dtype='i8'), 'PRIORITY_ASSIGNED': np.asarray(fs['PRIORITY'], dtype='i8')}, copy=False)
+        gtl = np.unique(won['TILELOCID'])
+        wg = np.ones(len(dz), dtype=bool)
+        del fs
+        
     else:
         if good_specf is not None:
             won = common.read_hdf5_blosc(good_specf)

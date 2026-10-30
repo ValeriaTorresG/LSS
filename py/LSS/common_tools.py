@@ -2383,6 +2383,227 @@ def write_LSS_scratchcp(ff, outf, comments=None, extname='LSS', logger=None, mod
     return True
 
 
+class FitsTableConcatenator:
+    '''
+    Concatenate FITS files that each hold one binary table (written by fitsio, with
+    identical columns) into a single file.  The result is byte-for-byte what fitsio
+    produces with write() of the first table and append() of the others, but the rows
+    are copied already encoded (e.g. by parallel workers) instead of being encoded
+    again in this process; cfitsio encoding is CPU-bound at ~70-90 MB/s.
+    '''
+    def __init__(self, fn):
+        self.out = open(fn, 'wb')
+        self.nrows = 0
+        self.head = None
+
+    @staticmethod
+    def _read(fn):
+        with fitsio.FITS(fn) as f:
+            hdu = f[1]
+            data_start = hdu.get_offsets()['data_start']
+            rowlen = hdu.read_header()['NAXIS1']
+            nrows = hdu.get_nrows()
+        with open(fn, 'rb') as f:
+            buf = f.read()
+        return buf[:data_start], buf[data_start:data_start + nrows*rowlen], nrows
+
+    @staticmethod
+    def _naxis2_offset(head):
+        # Offset of the (last, i.e. the table's) NAXIS2 card in the header bytes.
+        offs = [i for i in range(0, len(head), 80) if head[i:i+10] == b'NAXIS2  = ']
+        return offs[-1]
+
+    def add(self, fn):
+        head, data, nrows = self._read(fn)
+        if self.head is None:
+            self.head = head
+            self.inaxis2 = self._naxis2_offset(head)
+            self.out.write(head)
+        else:
+            # Same primary HDU and table header (columns, formats...) except for NAXIS2.
+            i = self._naxis2_offset(head)
+            blank = b' '*80
+            assert (len(head) == len(self.head) and i == self.inaxis2 and
+                    head[:i] + blank + head[i+80:] == self.head[:i] + blank + self.head[i+80:]), \
+                'FITS header of %s does not match the first table' % fn
+        self.out.write(data)
+        self.nrows += nrows
+
+    def close(self):
+        # Pad the data to a whole FITS block and set the final number of rows.
+        pad = (-self.out.tell()) % 2880
+        self.out.write(b'\0'*pad)
+        card = self.head[self.inaxis2:self.inaxis2+80]
+        card = card[:10] + (b'%20d' % self.nrows) + card[30:]
+        self.out.seek(self.inaxis2)
+        self.out.write(card)
+        self.out.close()
+
+
+# Array being written by write_LSS_par(); inherited by its forked workers.
+_par_write_arr = None
+
+def _write_fits_chunk(task):
+    fn, i0, i1, extname = task
+    fd = fitsio.FITS(fn, "rw")
+    fd.write(_par_write_arr[i0:i1], extname=extname)
+    fd.close()
+    return fn
+
+def write_LSS_par(ff, outf, extname='LSS', logger=None, mode=0o660, group='desi', nproc=None, chunk_rows=1000000):
+    '''
+    Same output file as write_LSS_scratchcp(ff, outf, extname=extname, ...) (byte-for-byte,
+    same permissions and group), but the rows are FITS-encoded in parallel by `nproc`
+    forked processes (default: all CPUs available to this process) into temporary files
+    in /dev/shm, which are then concatenated directly into `outf`.
+    '''
+    import multiprocessing
+    import shutil
+    import tempfile
+    global _par_write_arr
+    printlog('will write to '+outf, logger)
+    if nproc is None:
+        nproc = len(os.sched_getaffinity(0))
+    _par_write_arr = np.array(ff)
+    nrows = len(_par_write_arr)
+    bounds = list(range(0, nrows, chunk_rows)) + [nrows]
+    if nrows == 0:
+        bounds = [0, 0]
+    tmpdir = tempfile.mkdtemp(prefix='write_LSS_par-', dir='/dev/shm' if os.path.isdir('/dev/shm') else os.path.dirname(outf))
+    outftmp = outf+'.tmp'
+    try:
+        tasks = [(os.path.join(tmpdir, '%i.fits' % i), bounds[i], bounds[i+1], extname) for i in range(len(bounds)-1)]
+        out = FitsTableConcatenator(outftmp)
+        with multiprocessing.get_context('fork').Pool(processes=max(1, min(nproc, len(tasks)))) as pool:
+            for fn in pool.imap(_write_fits_chunk, tasks):
+                out.add(fn)
+                os.remove(fn)
+        out.close()
+    finally:
+        _par_write_arr = None
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    testcol = list(ff.dtype.names)[0]
+    try:
+        fitsio.read(outftmp, columns=(testcol))
+    except:
+        printwarn('read failed, output corrupted?! '+outftmp, logger)
+        return 'FAILED'
+    os.rename(outftmp, outf)
+    if group: # blank group will cause problems with chown
+        shutil.chown(outf, group=group)
+    os.chmod(outf, mode)
+    printlog('wrote ' + outf, logger)
+    return True
+
+
+# Output array of read_fits_par(); shared (anonymous mmap) with its forked workers.
+_par_read_arr = None
+
+def _read_fits_rows(task):
+    fn, ext, columns, i0, i1 = task
+    with fitsio.FITS(fn) as f:
+        _par_read_arr[i0:i1] = f[ext].read(columns=columns, rows=np.arange(i0, i1))
+    return i1 - i0
+
+def read_fits_par(fn, columns=None, ext=1, nproc=None, chunk_rows=2000000):
+    '''
+    Same array as fitsio.read(fn, columns=columns, ext=ext), with the rows read in
+    parallel by `nproc` forked processes (default: all CPUs available to this process).
+    '''
+    import mmap
+    import multiprocessing
+    global _par_read_arr
+    if nproc is None:
+        nproc = len(os.sched_getaffinity(0))
+    with fitsio.FITS(fn) as f:
+        nrows = f[ext].get_nrows()
+        dtype = f[ext].read(columns=columns, rows=[0]).dtype if nrows > 0 else None
+    if nrows == 0 or nproc == 1:
+        return fitsio.read(fn, columns=columns, ext=ext)
+    buf = mmap.mmap(-1, nrows*dtype.itemsize)
+    _par_read_arr = np.frombuffer(buf, dtype=dtype)
+    bounds = list(range(0, nrows, chunk_rows)) + [nrows]
+    tasks = [(fn, ext, columns, bounds[i], bounds[i+1]) for i in range(len(bounds)-1)]
+    try:
+        with multiprocessing.get_context('fork').Pool(processes=max(1, min(nproc, len(tasks)))) as pool:
+            assert sum(pool.map(_read_fits_rows, tasks)) == nrows
+        return _par_read_arr
+    finally:
+        _par_read_arr = None
+
+def _join_sort_idxs_unique(keys, left, right):
+    '''
+    Fast replacement for astropy.table.operations._get_join_sort_idxs(keys, left, right),
+    valid when every key column is a signed integer and the key tuples are unique within
+    each table.  Then each group of equal keys holds at most one left and one right row,
+    so join() only depends on the order of the groups (ascending lexical order of the
+    keys, reproduced here by a single combined int64 key) and not on the order inside a
+    group (which is where astropy's unstable structured-array argsort could matter).
+    Returns None when those conditions are not met.
+    '''
+    nl, nr = len(left), len(right)
+    if nl == 0 or nr == 0:
+        return None
+    code_l = np.zeros(nl, dtype=np.int64)
+    code_r = np.zeros(nr, dtype=np.int64)
+    span_tot = 1
+    for k in keys:
+        if hasattr(left[k], 'mask') or hasattr(right[k], 'mask'):
+            return None
+        lk = np.asarray(left[k])
+        rk = np.asarray(right[k])
+        if lk.dtype.kind != 'i' or rk.dtype.kind != 'i':
+            return None
+        # Dense rank of each value among both tables: same order and equalities as the
+        # values themselves, but small enough to combine all the keys into one int64.
+        uniq, rank = np.unique(np.concatenate([lk.astype(np.int64), rk.astype(np.int64)]), return_inverse=True)
+        span = len(uniq)
+        span_tot *= span
+        if span_tot >= 2**62:
+            return None
+        code_l = code_l*span + rank[:nl]
+        code_r = code_r*span + rank[nl:]
+    codes = np.concatenate([code_l, code_r])
+    idx_sort = np.argsort(codes, kind='stable')
+    s = codes[idx_sort]
+    same = s[1:] == s[:-1]
+    # Unique within each table: equal neighbours must be a (left, right) pair (left
+    # first, since the sort is stable) and no group can have more than two rows.
+    if np.any(same[1:] & same[:-1]):
+        return None
+    i = np.flatnonzero(same)
+    if np.any(idx_sort[i] >= nl) or np.any(idx_sort[i+1] < nl):
+        return None
+    idxs = np.flatnonzero(np.concatenate(([True], ~same, [True])))
+    return idxs, idx_sort
+
+def join_unique_keys(left, right, keys, join_type='inner', logger=None):
+    '''
+    Same result as astropy.table.join(left, right, keys=keys, join_type=join_type), but
+    much faster for large tables when the (integer) keys are unique within each table;
+    the rows, columns, masks and the values under the masks are all built by astropy
+    itself, only the sorting of the keys is replaced.  Falls back to the plain join()
+    otherwise.
+    '''
+    import astropy.table.operations as tops
+    left = left if isinstance(left, Table) else Table(left)
+    right = right if isinstance(right, Table) else Table(right)
+    keys = tuple(keys)
+    res = _join_sort_idxs_unique(keys, left, right)
+    if res is None:
+        printlog('join_unique_keys: keys not unique integers, using the standard join', logger)
+        return join(left, right, keys=keys, join_type=join_type)
+    def _sort_idxs(keys_, left_, right_):
+        assert tuple(keys_) == keys and len(left_) == len(left) and len(right_) == len(right)
+        return res
+    orig = tops._get_join_sort_idxs
+    tops._get_join_sort_idxs = _sort_idxs
+    try:
+        return join(left, right, keys=keys, join_type=join_type)
+    finally:
+        tops._get_join_sort_idxs = orig
+
+
 def read_fitsio_scratchcp(fdir, fname, columns=None, logger=None):
     # because reading from cfs is brutal
     tempf = os.getenv('SCRATCH')+'/'+fname+'.tmp'

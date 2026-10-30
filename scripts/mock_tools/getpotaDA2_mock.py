@@ -19,6 +19,7 @@ from fiberassign.utils import Logger
 from desitarget.io import read_targets_in_tiles
 import desimodel.focalplane
 import desimodel.footprint
+import desimodel.io as dmio
 trad = desimodel.focalplane.get_tile_radius_deg()*1.1 #make 10% greater just in case
 
 
@@ -31,7 +32,9 @@ from LSS.globals import main
 
 import bisect
 import time
-from datetime import datetime
+import shutil
+import tempfile
+from datetime import datetime, timezone
 import multiprocessing
 
 t_start = time.time()
@@ -69,7 +72,8 @@ if args.mock == 'ab2ndgen':
     tars = fitsio.read(infn)
     tarcols = list(tars.dtype.names)
     #tileoutdir = args.base_output+'SecondGenMocks/AbacusSummit/tartiles'+args.realization+'/'
-    tileoutdir = os.path.join(os.getenv('SCRATCH'), 'SecondGenMocks', 'AbacusSummit',args.prog , 'tartiles'+args.realization)
+    # tileoutdir = os.path.join(os.getenv('SCRATCH'), 'SecondGenMocks', 'AbacusSummit',args.prog , 'tartiles'+args.realization)
+    tileoutdir = os.path.join(args.base_output, 'SecondGenMocks', 'AbacusSummit' + args.mock_version, 'tartiles' + args.realization)
     paoutdir = os.path.join(args.base_output+'SecondGenMocks', 'AbacusSummit'+args.mock_version, 'mock'+args.realization)
 elif args.mock == 'ezmocks6':
     # #tr = args.tracer
@@ -127,7 +131,8 @@ if not os.path.exists(paoutdir):
     os.makedirs(paoutdir)
     #print('made '+paoutdir)
 
-tiletab = Table.read(os.path.join(desi_input_dir, 'survey', 'catalogs', 'DA2', 'LSS', 'tiles-'+args.prog+'.fits'))
+# tiletab = Table.read(os.path.join(desi_input_dir, 'survey', 'catalogs', 'DA2', 'LSS', 'tiles-'+args.prog+'.fits'))
+tiletab = Table.read(os.path.join(desi_input_dir, 'survey', 'catalogs', 'DA3', 'LSS', 'tiles-'+args.prog+'.fits'))
 log.info('Reading startup globals: %.3f' % (time.time() - t_start))
 
 def get_tile_targ(tile):
@@ -147,7 +152,8 @@ def get_tile_targ(tile):
     Idec = slice(i0, i1+1)
     inds = desimodel.footprint.find_points_radec(tile['RA'], tdec,
                                                  tars['RA'][Idec], tars['DEC'][Idec])
-    rtw = tars[i0 + np.array(inds)]
+    # dtype=int so that a tile with no targets gives an empty (not float) index array
+    rtw = tars[i0 + np.array(inds, dtype=int)]
     rmtl = Table(rtw)
     #print('made table')
     del rtw
@@ -176,21 +182,22 @@ def write_tile_targ(ind):
     #print('added columns for', fname)
     rmtl.write(fname, format='fits', overwrite=True)
     #print('added columns, wrote to', fname)
+    return len(rmtl)
 
 margins = get_default_exclusion_margins()
 rann = 0
 n = 0
 
-def getpa(ind):
+def getpa(ind, fbah, hw):
+    '''
+    `fbah` is the fiberassign header dict from read_fba_header() (read once in main() instead
+    of again here) and `hw` is the Hardware matching its RUNDATE.
+    '''
     #tile = 1230
     tile = tiletab[ind]['TILEID']
-    ts = '%06i' % tile
 
     tilefn = os.path.join(args.tile_temp_dir, str(tile)+'-'+str(rann)+'-tiles.fits')
 
-
-    fbah = fitsio.read_header(os.path.join(desi_input_dir, 'target', 'fiberassign', 'tiles', 'trunk', ts[:3], 'fiberassign-'+ts+'.fits.gz'))
-    dt = fbah['RUNDATE']#[:19]
     pr = args.prog
     if not os.path.isfile(tilefn):
         t = Table(tiletab[ind])
@@ -199,15 +206,11 @@ def getpa(ind):
         t['MTLTIME'] = fbah['MTLTIME']
         t['FA_RUN'] = fbah['FA_RUN']
         t['PROGRAM'] = pr
-    
+
     obsha = fbah['FA_HA']
     obstheta = fbah['FIELDROT']
 
-    tt = parse_datetime(dt)
-    hw = get_hardware_for_time(tt)
-    assert(hw is not None)
 
-    
     if not os.path.isfile(tilefn):
         t.write(tilefn, overwrite=True)
 
@@ -251,30 +254,30 @@ def getpa(ind):
     asgn = Assignment(tgs, tgsavail, favail, stucksky)
     tgsavail = asgn.targets_avail()
     avail = tgsavail.tile_data(tile)
-    navail = np.sum([len(avail[x]) for x in avail.keys()])
-    fibers = dict(hw.loc_fiber)
-    fdata = Table()
-    fdata['LOCATION'] = np.zeros(navail, dtype=int)
-    fdata['FIBER']    = np.zeros(navail, dtype=int)
-    fdata['TARGETID'] = np.zeros(navail, dtype=int)
+    fibers = hw.loc_fiber
 
-    off = 0
     # The "FAVAIL" (available targets) HDU is sorted first by LOCATION,
-    # then by TARGETID.
-    for lid in sorted(avail.keys()):
-        # lid (location id) is a scalar, tg (target ids) is an array
-        tg = avail[lid]
-        fdata['LOCATION'][off:off+len(tg)] = lid
-        fdata['FIBER']   [off:off+len(tg)] = fibers[lid]
-        fdata['TARGETID'][off:off+len(tg)] = sorted(tg)
-        off += len(tg)
+    # then by TARGETID.  Built with whole-array numpy ops instead of filling
+    # astropy columns location by location (same values and dtypes).
+    lids = sorted(avail.keys())
+    ntg = np.array([len(avail[lid]) for lid in lids], dtype=int)
+    if np.sum(ntg) == 0:
+        # No target reachable by any fiber: nothing to add for this tile.
+        return None
+    fdata = Table()
+    fdata['LOCATION'] = np.repeat(np.array(lids, dtype=int), ntg)
+    fdata['FIBER']    = np.repeat(np.array([fibers[lid] for lid in lids], dtype=int), ntg)
+    fdata['TARGETID'] = np.concatenate([np.sort(np.array(avail[lid], dtype=int)) for lid in lids])
     fdata = join(fdata,tar_tab,keys=['TARGETID'],join_type='left')
     if args.getcoll == 'y':
         coll = asgn.check_avail_collisions(tile)
-        kl = np.array(list(coll.keys())).transpose()
-        locs = kl[0]
-        ids = kl[1]
-        locids = ids*10000+locs
+        if len(coll) > 0:
+            kl = np.array(list(coll.keys())).transpose()
+            locs = kl[0]
+            ids = kl[1]
+            locids = ids*10000+locs
+        else:
+            locids = np.zeros(0, dtype=int)
         log.info('N collisions: %i' % len(coll))
         locidsin = np.isin(fdata['LOCATION']+10000*fdata['TARGETID'],locids)
         log.info('N collisions original: %i %i' % (np.sum(locidsin),len(fdata)))
@@ -283,14 +286,107 @@ def getpa(ind):
     fdata['TILEID'] = tile
     return fdata
 
-def run_one_tile(ind):
+def run_one_tile(ind, fbah, hw):
     t0 = time.time()
-    write_tile_targ(ind)
-    res = getpa(ind)
+    ntarg = write_tile_targ(ind)
+    res = None
+    if ntarg > 0:
+        res = getpa(ind, fbah, hw)
+    if res is None:
+        log.info('Tile %i: no available targets (%i targets within radius), skipping' % (tiletab[ind]['TILEID'], ntarg))
+        return None
     res = np.array(res)
     t1 = time.time()
     log.info('Tile %i took %.3f sec' % (tiletab[ind]['TILEID'], t1-t0))
     return res
+
+# Per-process cache of the Hardware currently in use: (index into hardware_times, hw).
+_hw_cache = (None, None)
+
+def run_tile_group(task):
+    '''
+    Run a group of tiles that all share the same hardware configuration.
+    task = (ihw, [(ind, fbah), ...]), where hardware_times[ihw] holds the RUNDATE whose
+    load_hardware() call defines that configuration (exactly what the serial version
+    used to load in the main process).  The Hardware is built here, in the worker, so
+    the ~600 configurations are loaded in parallel instead of in series.
+    '''
+    global _hw_cache
+    ihw, tiles = task
+    if _hw_cache[0] != ihw:
+        _hw_cache = (None, None)
+        hw = load_hardware(rundate=hardware_times[ihw][2], add_margins=margins, get_time_range=True)[0]
+        _hw_cache = (ihw, hw)
+    hw = _hw_cache[1]
+    out = []
+    for ind, fbah in tiles:
+        res = run_one_tile(ind, fbah, hw)
+        if res is None:
+            continue
+        # Encode the FITS table here, in parallel; main() only concatenates the bytes.
+        fn = os.path.join(chunk_dir, 'pota-%i.fits' % tiletab[ind]['TILEID'])
+        fitsio.write(fn, res, extname='LSS', clobber=True)
+        out.append((fn, len(res), np.sum(res['COLLISION'])))
+    return out
+
+class FitsTableConcatenator:
+    '''
+    Concatenate FITS files that each hold one binary table (written by fitsio, with
+    identical columns) into a single file.  The result is byte-for-byte what fitsio
+    produces with write() of the first table and append() of the others, but the rows
+    are copied already encoded (by the workers, in parallel) instead of being encoded
+    again in this process, which is what made the serial writing slow.
+    '''
+    def __init__(self, fn):
+        self.out = open(fn, 'wb')
+        self.nrows = 0
+        self.head = None
+
+    @staticmethod
+    def _read(fn):
+        with fitsio.FITS(fn) as f:
+            hdu = f[1]
+            data_start = hdu.get_offsets()['data_start']
+            rowlen = hdu.read_header()['NAXIS1']
+            nrows = hdu.get_nrows()
+        with open(fn, 'rb') as f:
+            buf = f.read()
+        return buf[:data_start], buf[data_start:data_start + nrows*rowlen], nrows
+
+    @staticmethod
+    def _naxis2_offset(head):
+        # Offset of the (last, i.e. the table's) NAXIS2 card in the header bytes.
+        offs = [i for i in range(0, len(head), 80) if head[i:i+10] == b'NAXIS2  = ']
+        return offs[-1]
+
+    def add(self, fn):
+        head, data, nrows = self._read(fn)
+        if self.head is None:
+            self.head = head
+            self.inaxis2 = self._naxis2_offset(head)
+            self.out.write(head)
+        else:
+            # Same primary HDU and table header (columns, formats...) except for NAXIS2.
+            i = self._naxis2_offset(head)
+            blank = b' '*80
+            assert (len(head) == len(self.head) and i == self.inaxis2 and
+                    head[:i] + blank + head[i+80:] == self.head[:i] + blank + self.head[i+80:]), \
+                'FITS header of %s does not match the first table' % fn
+        self.out.write(data)
+        self.nrows += nrows
+
+    def close(self):
+        # Pad the data to a whole FITS block and set the final number of rows.
+        pad = (-self.out.tell()) % 2880
+        self.out.write(b'\0'*pad)
+        card = self.head[self.inaxis2:self.inaxis2+80]
+        card = card[:10] + (b'%20d' % self.nrows) + card[30:]
+        self.out.seek(self.inaxis2)
+        self.out.write(card)
+        self.out.close()
+
+# Directory for the per-tile FITS tables written by the workers; set in main().
+chunk_dir = None
 
 def read_fba_header(ind):
     '''
@@ -309,17 +405,39 @@ def parse_datetime(s):
         # msg = "Requested run date '{}' is not timezone-aware.  Assuming UTC.".format(runtime)
         d = d.replace(tzinfo=timezone.utc)
 
+def focalplane_time_range(rundate):
+    '''
+    Return the (time_lo, time_hi) that load_hardware(rundate=rundate, get_time_range=True)
+    would return, without building the (expensive) Hardware object.  The rundate parsing
+    and load_focalplane() call are the same ones done inside fiberassign's
+    load_hardware_args().
+    '''
+    try:
+        runtime = datetime.strptime(rundate, "%Y-%m-%dT%H:%M:%S%z")
+    except ValueError:
+        runtime = datetime.strptime(rundate, "%Y-%m-%dT%H:%M:%S")
+        runtime = runtime.replace(tzinfo=timezone.utc)
+    fp, exclude, state, create_time, time_lo, time_hi = dmio.load_focalplane(runtime, get_time_range=True)
+    return time_lo, time_hi
+
+# List of (time_lo, time_hi, rundate): the hardware configurations, as the time range
+# over which each is valid and the RUNDATE to pass to load_hardware() to build it.
 hardware_times = []
 def get_hardware_for_time(t):
+    '''
+    Return the index into `hardware_times` of the configuration valid at time `t`.
+    '''
     global hardware_times
-    for tlo,thi,hw in hardware_times:
+    for i,(tlo,thi,rundate) in enumerate(hardware_times):
         if (tlo <= t) and (thi is None or thi > t):
             #print('Match to time range', tlo, 'to', thi)
-            return hw
+            return i
     return None
 
 def main():
-    from multiprocessing import Pool
+    # Use fork explicitly (Python >= 3.14 defaults to forkserver): the workers need the
+    # `tars` and `tiletab` globals without copying/pickling them.
+    Pool = multiprocessing.get_context('fork').Pool
     tls = list(tiletab['TILEID'])
     #inds = np.flatnonzero(np.array(tls) == 1230)
     #inds = np.arange(256)
@@ -335,60 +453,72 @@ def main():
     t1 = time.time()
     log.info('Reading fiberassign headers in parallel: %.3f sec' % (t1-t0))
 
-    # Read all hardware configurations for our RUNDATES.
-    global hardware_times
-    for t in rundates:
+    # Find the hardware configurations for our RUNDATES.  This reproduces exactly the
+    # serial loop
+    #     for t in rundates:
+    #         if get_hardware_for_time(parse_datetime(t)) is not None: continue
+    #         hw,time_lo,time_hi = load_hardware(rundate=t, add_margins=margins, get_time_range=True)
+    #         hardware_times.append((time_lo, time_hi, hw))
+    # but gets the time ranges (cheap) in parallel and defers building each Hardware
+    # (expensive) to the workers.  The first call warms up desimodel's focalplane cache,
+    # which the forked workers then inherit.
+    global hardware_times, _hw_cache
+    focalplane_time_range(rundates[0])
+    with Pool(processes=args.nprocs) as pool:
+        time_ranges = pool.map(focalplane_time_range, rundates)
+    for t,(time_lo,time_hi) in zip(rundates, time_ranges):
         dt = parse_datetime(t)
         cached = get_hardware_for_time(dt)
         if cached is not None:
             continue
-        hw,time_lo,time_hi = load_hardware(rundate=t, add_margins=margins, get_time_range=True)
-        hardware_times.append((time_lo, time_hi, hw))
+        hardware_times.append((time_lo, time_hi, t))
+    log.info('Hardware configurations: %i' % len(hardware_times))
+
+    # Group the tiles by hardware configuration, in chunks of at most `group_size` tiles,
+    # so that each worker builds a given Hardware once for several tiles.
+    group_size = 8
+    tiles_by_hw = {}
+    for ind,h in zip(inds, headers):
+        ihw = get_hardware_for_time(parse_datetime(h['RUNDATE']))
+        assert(ihw is not None)
+        tiles_by_hw.setdefault(ihw, []).append((ind, h))
+    tasks = []
+    for ihw in sorted(tiles_by_hw.keys()):
+        tl = tiles_by_hw[ihw]
+        for i in range(0, len(tl), group_size):
+            tasks.append((ihw, tl[i:i+group_size]))
+    # Build the first configuration here so that it (and the rest of fiberassign's
+    # warm-up) is inherited by the forked workers.
+    _hw_cache = (0, load_hardware(rundate=hardware_times[0][2], add_margins=margins, get_time_range=True)[0])
 
     t2 = time.time()
-    log.info('Loading hardware in series: %.3f sec' % (t2-t1))
+    log.info('Finding hardware time ranges in parallel: %.3f sec' % (t2-t1))
 
-    # Keeping this old code because it's a little easier to understand than what we're doing
-    # below (streaming results to disk).
-    #
-    # # Run fiber assignment on tiles in parallel
-    # with Pool(processes=128) as pool:
-    #     res = pool.map(run_one_tile, inds)
-    # t3 = time.time()
-    # log.info('Running tiles in parallel: %.3f sec' % (t3-t2))
-    #
-    # # Merge and write results
-    # colltot = np.concatenate(res)
-    # if args.getcoll == 'y':
-    #     print(len(colltot),np.sum(colltot['COLLISION']))
-    # t3b = time.time()
-    # 
-    # common.write_LSS(colltot,paoutdir+'/pota-'+args.prog+'.fits')
-    # t4 = time.time()
-    # log.info('Merging results and writing: %.3f sec (%.3f + %.3f)' % (t4-t3, t3b-t3, t4-t3b))
-
-    # Write output *while* retrieving results in parallel
+    # Write output *while* retrieving results in parallel.  Results come back in the
+    # (fixed) order of `tasks`, so the row order of the output is reproducible; the
+    # serial-loading version wrote tiles in whatever order they finished.
     outfn = os.path.join(paoutdir, 'pota-'+args.prog+'.fits')
     tempout = outfn + '.tmp'
-    fits = fitsio.FITS(tempout, 'rw', clobber=True)
-    first = True
-    ntot = 0
-    ncoll = 0
-    with Pool(processes=args.nprocs) as pool:
-        it = pool.imap_unordered(run_one_tile, inds)
-        # fetch results as they complete
-        for res in it:
-            ntot += len(res)
-            ncoll += np.sum(res['COLLISION'])
-            # First result: write to output file.
-            if first:
-                fits.write(res, extname='LSS')
-                first = False
-            # Subsequent results: append to output file.
-            else:
-                fits[-1].append(res)
-            del res
-    fits.close()
+    # Per-tile tables go to node-local memory (/dev/shm) when available; each is
+    # deleted as soon as it has been copied into the output.
+    global chunk_dir
+    chunk_dir = tempfile.mkdtemp(prefix='getpota-', dir='/dev/shm' if os.path.isdir('/dev/shm') else paoutdir)
+    try:
+        fits = FitsTableConcatenator(tempout)
+        ntot = 0
+        ncoll = 0
+        with Pool(processes=args.nprocs) as pool:
+            it = pool.imap(run_tile_group, tasks)
+            # fetch results as they complete
+            for group in it:
+                for fn, nrows, nc in group:
+                    ntot += nrows
+                    ncoll += nc
+                    fits.add(fn)
+                    os.remove(fn)
+        fits.close()
+    finally:
+        shutil.rmtree(chunk_dir, ignore_errors=True)
     os.rename(tempout, outfn)
     log.info('Wrote %s' % outfn)
     t3 = time.time()
