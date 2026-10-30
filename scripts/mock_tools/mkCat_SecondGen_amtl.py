@@ -696,8 +696,14 @@ if args.apply_veto == 'y':
 
     gc.collect()
 if args.apply_veto_ran == 'y':
-    mapn = fitsio.read(os.path.join(lssmapdirout, tracer_clus + '_mapprops_healpix_nested_nside' + str(nside) + '_N.fits'))       
-    maps = fitsio.read(os.path.join(lssmapdirout, tracer_clus + '_mapprops_healpix_nested_nside' + str(nside) + '_S.fits'))
+    # mapn = fitsio.read(os.path.join(lssmapdirout, tracer_clus + '_mapprops_healpix_nested_nside' + str(nside) + '_N.fits'))       
+    # maps = fitsio.read(os.path.join(lssmapdirout, tracer_clus + '_mapprops_healpix_nested_nside' + str(nside) + '_S.fits'))
+    
+    #!-------------------------------------------
+    tracer_hp = 'BGS_BRIGHT' if tracer_clus.startswith('BGS') else tracer_clus
+    mapn = fitsio.read(os.path.join(lssmapdirout, tracer_hp + '_mapprops_healpix_nested_nside' + str(nside) + '_N.fits'))
+    maps = fitsio.read(os.path.join(lssmapdirout, tracer_hp + '_mapprops_healpix_nested_nside' + str(nside) + '_S.fits'))
+    
     mapcuts = mainp.mapcuts
     
     global _parfun2
@@ -869,7 +875,11 @@ if args.mkclusdat == 'y':
 
        #readdir = dirout
     
-    ct.mkclusdat(os.path.join(readdir, args.tracer + notqso), weightileloc, tp=args.tracer, dchi2= None, zmin=mainp.zmin, zmax=mainp.zmax, use_map_veto=args.use_map_veto, subfrac=subfrac, zsplit=zsplit, ismock=True, ccut=args.ccut,logger=logger,exttp='.h5') #, return_cat='y', write_cat='n')
+    # ct.mkclusdat(os.path.join(readdir, args.tracer + notqso), weightileloc, tp=args.tracer, dchi2= None, zmin=mainp.zmin, zmax=mainp.zmax, use_map_veto=args.use_map_veto, subfrac=subfrac, zsplit=zsplit, ismock=True, ccut=args.ccut,logger=logger,exttp='.h5') #, return_cat='y', write_cat='n')
+    #!--------------------------------------------------
+    ct.mkclusdat(os.path.join(readdir, args.tracer + notqso), redo_fracz=True, weighttileloc=True, tp=args.tracer, dchi2=None,
+                 zmin=mainp.zmin, zmax=mainp.zmax, use_map_veto=args.use_map_veto, subfrac=subfrac, zsplit=zsplit,
+                 ismock=True, ccut=args.ccut, logger=logger, exttp='.fits')
     #This is for bright Uchuu:  ct.mkclusdat(os.path.join(readdir, args.tracer + notqso), weightileloc, tp=args.tracer, dchi2= None, zmin=mainp.zmin, zmax=mainp.zmax, use_map_veto=args.use_map_veto, subfrac=subfrac, zsplit=zsplit, ismock=True, ccut=args.ccut,logger=logger,exttp='.h5', extracols=['ABSMAG_R', 'REST_GMR_0P1']) #, return_cat='y', write_cat='n')
 #    common.write_LSS(clusdat, os.path.join(dirout, args.tracer + notqso + '_clustering.dat.fits'))
 
@@ -928,7 +938,10 @@ if args.mkclusran == 'y':
     ranin = os.path.join(readdir, finaltracer) + '_'
     tlf = fitsio.read(fl+'frac_tlobs.fits')
     common.printlog('read in frac_tlobs file',logger)
-    mockobs = fitsio.read(os.path.join(outdir, 'datcomb_' + pdir + 'assignwdup.fits'),columns=['TILEID','LOCATION','PRIORITY'])
+    # mockobs = fitsio.read(os.path.join(outdir, 'datcomb_' + pdir + 'assignwdup.fits'),columns=['TILEID','LOCATION','PRIORITY'])
+    
+    mockobs = fitsio.read(os.path.join(maindir, f'fba{mocknum}', f'datcomb_{pdir}assignwdup.fits'), columns=['TILEID', 'LOCATION', 'PRIORITY'])
+    
     mockobs_tlid = 10000*mockobs['TILEID'] +mockobs['LOCATION']
     badpri = mockobs['PRIORITY'] > maxp
     bad_tlid = mockobs_tlid[badpri]
